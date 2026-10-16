@@ -1,0 +1,9 @@
+faiss-cpu
+numpy
+torch
+pypdf
+sentence-transformers
+transformers
+rank-bm25
+safetensors
+streamlit

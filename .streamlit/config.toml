@@ -1,0 +1,20 @@
+[theme]
+base = "dark"
+primaryColor = "#9B8CFF"
+backgroundColor = "#0C0F15"
+secondaryBackgroundColor = "#151923"
+textColor = "#EDF0F7"
+font = "sans serif"
+headingFont = "sans serif"
+baseRadius = "large"
+paddingTop = "2rem"
+paddingBottom = "7rem"
+
+[theme.sidebar]
+backgroundColor = "#10131B"
+secondaryBackgroundColor = "#181C27"
+textColor = "#E6E9F1"
+borderColor = "#262B39"
+
+[server]
+fileWatcherType = "none"

@@ -1,0 +1,15 @@
+﻿.venv/
+.venv-1/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+.rag_cache/
+models/
+*.faiss
+*.index
+
+documents/
+
