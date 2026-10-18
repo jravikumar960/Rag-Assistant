@@ -445,6 +445,38 @@ def _requested_relation(question: str) -> tuple[str, str] | None:
     return None
 
 
+def _requested_comparison(question: str) -> tuple[str, str] | None:
+    """Extract two explicit comparison entities from the first question clause."""
+    clause = question.strip().split("?", 1)[0]
+    clause = re.sub(
+        r"\b(?:show|include|provide|give|cite)\s+(?:me\s+)?(?:the\s+)?"
+        r"(?:exact\s+)?(?:sources?|citations?|supporting\s+\w+|evidence|page\s+numbers?).*$",
+        "",
+        clause,
+        flags=re.IGNORECASE,
+    )
+    clause = re.sub(r"[.!]+\s*(?:show|include|provide|give|cite)\b.*$", "", clause, flags=re.IGNORECASE)
+    clause = clause.strip(" \t\r\n.,;:!?")
+    match = re.fullmatch(
+        r"compare\s+(.+?)\s+(with|and|versus|vs\.?)\s+(.+)",
+        clause,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    entities = []
+    for value in (match.group(1), match.group(3)):
+        entity = value.strip(" \t\r\n\"'“”‘’.,;:!?")
+        entity = re.sub(r"^(?:the|a|an)\s+", "", entity, flags=re.IGNORECASE)
+        if not entity:
+            return None
+        entities.append(entity)
+    if entities[0].casefold() == entities[1].casefold():
+        return None
+    return entities[0], entities[1]
+
+
 def _answer_sentences(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
 
@@ -480,10 +512,55 @@ def _supports_requested_relation(question: str, sentence: str) -> bool:
     return False
 
 
+def _comparison_entity_pattern(entity: str) -> str:
+    words = entity.split()
+    if words[-1].lower().endswith("s"):
+        words[-1] = words[-1][:-1]
+    return r"\b" + r"\s+".join(re.escape(word) for word in words) + r"s?\b"
+
+
+def _supports_requested_comparison(question: str, sentence: str) -> bool:
+    """Require both named entities and an explicit contrast in one sentence."""
+    entities = _requested_comparison(question)
+    if entities is None:
+        return False
+    first_pattern, second_pattern = (
+        _comparison_entity_pattern(entity) for entity in entities
+    )
+    first_matches = list(re.finditer(first_pattern, sentence, re.IGNORECASE))
+    second_matches = list(re.finditer(second_pattern, sentence, re.IGNORECASE))
+    if not first_matches or not second_matches:
+        return False
+
+    contrast_pattern = re.compile(
+        r"\b(?:whereas|while|unlike|in\s+contrast|compared\s+(?:with|to)|"
+        r"versus|vs\.?|rather\s+than|"
+        r"(?:more|less|better|worse|faster|slower|higher|lower|larger|smaller)"
+        r"\b.{0,100}?\bthan)\b",
+        re.IGNORECASE,
+    )
+    for first in first_matches:
+        for second in second_matches:
+            if first.end() <= second.start():
+                interval = sentence[first.end():second.start()]
+            elif second.end() <= first.start():
+                interval = sentence[second.end():first.start()]
+            else:
+                continue
+            if contrast_pattern.search(interval):
+                return True
+    return False
+
+
 def _verified_answer_sentences(question: str, answer: str, passages: list[dict]):
     """Accept only complete generated sentences found verbatim in evidence."""
     generated = _answer_sentences(answer)
-    if not generated or _requested_relation(question) is None:
+    comparison = _requested_comparison(question)
+    if not generated or (comparison is None and _requested_relation(question) is None):
+        return []
+    # Keep comparison output to one claim, so its citation maps unambiguously
+    # to the exact retrieved passage shown by the existing citation UI.
+    if comparison is not None and len(generated) != 1:
         return []
     verified = []
     for proposed in generated:
@@ -493,7 +570,11 @@ def _verified_answer_sentences(question: str, answer: str, passages: list[dict])
                 if (
                     _normalize_sentence_for_match(proposed)
                     == _normalize_sentence_for_match(source_sentence)
-                    and _supports_requested_relation(question, source_sentence)
+                    and (
+                        _supports_requested_comparison(question, source_sentence)
+                        if comparison is not None
+                        else _supports_requested_relation(question, source_sentence)
+                    )
                 ):
                     match = (_normalize_sentence_for_match(source_sentence), index)
                     break
@@ -529,6 +610,17 @@ def _first_supported_limitation(question: str, passages: list[dict]):
     return None
 
 
+def _first_supported_comparison(question: str, passages: list[dict]):
+    """Return the first exact retrieved sentence that explicitly compares both entities."""
+    if _requested_comparison(question) is None:
+        return None
+    for index, passage in enumerate(passages, start=1):
+        for sentence in _answer_sentences(str(passage.get("text", ""))):
+            if _supports_requested_comparison(question, sentence):
+                return (sentence, index)
+    return None
+
+
 def select_citations(question, answer, passages):
     """Select only passages containing exact, relation-checked answer sentences."""
     return list(dict.fromkeys(index for _, index in _verified_answer_sentences(question, answer, passages)))
@@ -538,21 +630,32 @@ def generate_answer(question: str, retrieved_chunks: list[dict], tokenizer, llm)
     """Generate once, then return only exact evidence sentences that pass a supported relation rule."""
     if not retrieved_chunks:
         return "I couldn't find relevant information in the PDF to answer this question."
-    if _requested_relation(question) is None:
+    comparison = _requested_comparison(question)
+    if _requested_relation(question) is None and comparison is None:
         return "I couldn't verify a direct answer to this question from the retrieved PDF passages."
 
     context = "\n\n".join(
         f"[Evidence {i} | Source: {c['source']} | Page: {c['page']}]\n{c['text']}"
         for i, c in enumerate(retrieved_chunks, start=1)
     )
-    messages = [
-        {"role": "system", "content": (
+    if comparison is not None:
+        system_instruction = (
+            "Return at most one exact sentence from the supplied PDF evidence that explicitly "
+            f"contrasts both {comparison[0]} and {comparison[1]}. The sentence must name both "
+            "entities and state a contrast between them. Copy it verbatim, including punctuation. "
+            "Do not paraphrase, combine, explain, or add facts. If no such sentence is present, "
+            "return exactly: INSUFFICIENT EVIDENCE."
+        )
+    else:
+        system_instruction = (
             "Select only exact sentence(s) from the supplied PDF evidence that directly state "
             "the requested relation. Copy every selected sentence verbatim, including punctuation. "
             "Do not paraphrase, combine, explain, or add facts. If no sentence directly answers "
             "the question, return exactly: INSUFFICIENT EVIDENCE. Return only selected sentence(s) "
             "or that abstention phrase."
-        )},
+        )
+    messages = [
+        {"role": "system", "content": system_instruction},
         {"role": "user", "content": f"Question:\n{question}\n\nPDF evidence:\n{context}"},
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -569,9 +672,17 @@ def generate_answer(question: str, retrieved_chunks: list[dict], tokenizer, llm)
         output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True,
     ).strip()
     if not proposed or proposed.upper() == "INSUFFICIENT EVIDENCE":
-        return "I couldn't find sufficient direct evidence in the retrieved PDF passages to answer this question."
+        if comparison is None:
+            return "I couldn't find sufficient direct evidence in the retrieved PDF passages to answer this question."
+        verified = []
+    else:
+        verified = _verified_answer_sentences(question, proposed, retrieved_chunks)
 
-    verified = _verified_answer_sentences(question, proposed, retrieved_chunks)
+    if comparison is not None and not verified:
+        direct_comparison = _first_supported_comparison(question, retrieved_chunks)
+        if direct_comparison is None:
+            return "I couldn't verify a direct comparison from the retrieved PDF passages."
+        verified = [direct_comparison]
     if not verified:
         direct_definition = _first_supported_definition(question, retrieved_chunks)
         if direct_definition is not None:

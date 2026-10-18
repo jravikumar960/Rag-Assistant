@@ -237,6 +237,132 @@ class CitationTests(unittest.TestCase):
         )
         self.assertIn("[Evidence 1] notes.pdf, page 10", gradient_answer)
 
+    def test_comparison_parser_extracts_entities_and_ignores_output_instructions(self):
+        self.assertEqual(
+            rag._requested_comparison("Compare CNN and RNN. Show the exact sources."),
+            ("CNN", "RNN"),
+        )
+        self.assertEqual(
+            rag._requested_comparison("Compare Random Forest with Decision Trees show sources"),
+            ("Random Forest", "Decision Trees"),
+        )
+        self.assertEqual(
+            rag._requested_comparison("Compare CNN versus RNN"),
+            ("CNN", "RNN"),
+        )
+
+    def test_supported_cnn_rnn_comparison_cites_exact_page_34_sentence(self):
+        sentence = (
+            "For example, convolutional neural networks (CNNs) perform exceptionally well "
+            "in image processing, whereas Recurrent Neural Networks (RNNs) perform well "
+            "in text and voice processing."
+        )
+        answer, calls = self._run_generation(
+            "Compare CNN and RNN. Show the exact sources.",
+            {
+                "text": "Advantages of feedforward neural networks. " + sentence,
+                "source": "DEEP LEARNING ( R20A06610 ).pdf",
+                "page": 34,
+            },
+            sentence,
+        )
+        self.assertEqual(
+            answer,
+            sentence + "\n\nSources: [Evidence 1] DEEP LEARNING ( R20A06610 ).pdf, page 34",
+        )
+        self.assertEqual(calls, 1)
+
+    def test_supported_random_forest_decision_tree_comparison_cites_page_30(self):
+        sentence = (
+            "Difference between Decision Tree and Random Forest Hence, there is a conclusion "
+            "that random forests are much more successful than decision trees only if the "
+            "trees are diverse and acceptable."
+        )
+        answer, calls = self._run_generation(
+            "compare Random Forest with Decision Trees",
+            {
+                "text": sentence,
+                "source": "811790898-Random-Forest-Algorithm.pdf",
+                "page": 30,
+            },
+            sentence,
+        )
+        self.assertEqual(
+            answer,
+            sentence + "\n\nSources: [Evidence 1] 811790898-Random-Forest-Algorithm.pdf, page 30",
+        )
+        self.assertEqual(calls, 1)
+
+    def test_random_forest_comparison_falls_back_to_exact_page_30_evidence(self):
+        sentence = (
+            "Difference between Decision Tree and Random Forest Hence, there is a conclusion "
+            "that random forests are much more successful than decision trees only if the "
+            "trees are diverse and acceptable."
+        )
+        passage = {
+            "text": sentence,
+            "source": "811790898-Random-Forest-Algorithm.pdf",
+            "page": 30,
+        }
+        for generated in (
+            "Random forests are more successful than decision trees when the trees are diverse and acceptable.",
+            "INSUFFICIENT EVIDENCE",
+        ):
+            with self.subTest(generated=generated):
+                answer, calls = self._run_generation(
+                    "Compare Random Forest with Decision Trees",
+                    passage,
+                    generated,
+                )
+                self.assertEqual(
+                    answer,
+                    sentence + "\n\nSources: [Evidence 1] 811790898-Random-Forest-Algorithm.pdf, page 30",
+                )
+                self.assertEqual(calls, 1)
+
+    def test_comparison_abstains_when_only_one_entity_is_supported(self):
+        sentence = "CNNs perform exceptionally well in image processing."
+        answer, calls = self._run_generation(
+            "Compare CNN and RNN",
+            {"text": sentence, "source": "vision.pdf", "page": 4},
+            sentence,
+        )
+        self.assertIn("couldn't verify a direct comparison", answer)
+        self.assertNotIn("Sources:", answer)
+        self.assertEqual(calls, 1)
+
+    def test_comparison_rejects_both_entities_without_explicit_contrast(self):
+        sentence = "CNN and RNN are neural network types."
+        answer, calls = self._run_generation(
+            "Compare CNN and RNN",
+            {"text": sentence, "source": "deep-learning.pdf", "page": 8},
+            sentence,
+        )
+        self.assertIn("couldn't verify a direct comparison", answer)
+        self.assertNotIn("Sources:", answer)
+        self.assertEqual(calls, 1)
+
+    def test_comparison_rejects_unrelated_evidence_with_overlapping_keywords(self):
+        sentence = "The syllabus glossary lists CNN, RNN, Random Forest, and Decision Trees as keywords."
+        answer, calls = self._run_generation(
+            "Compare CNN and RNN",
+            {"text": sentence, "source": "syllabus.pdf", "page": 2},
+            sentence,
+        )
+        self.assertIn("couldn't verify a direct comparison", answer)
+        self.assertNotIn("Sources:", answer)
+        self.assertEqual(calls, 1)
+
+    def test_supported_comparison_uses_only_one_generation_pass(self):
+        sentence = "CNNs process images, whereas RNNs process sequences."
+        answer, calls = self._run_generation(
+            "Compare CNN and RNN",
+            {"text": sentence, "source": "models.pdf", "page": 12},
+            sentence,
+        )
+        self.assertIn(sentence, answer)
+        self.assertEqual(calls, 1)
+
     def test_random_forest_disadvantages_with_output_instruction_cites_page_37(self):
         sentence = (
             "The main limitation of random forest is that due to a large number of trees "
