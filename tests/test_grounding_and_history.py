@@ -237,6 +237,55 @@ class CitationTests(unittest.TestCase):
         )
         self.assertIn("[Evidence 1] notes.pdf, page 10", gradient_answer)
 
+    def test_random_forest_disadvantage_phrasings_both_use_grounded_page_37_evidence(self):
+        sentence = (
+            "The main limitation of random forest is that due to a large number of trees "
+            "the algorithm takes a long time to train which makes it slow and ineffective "
+            "for real-time predictions."
+        )
+        passage = "\uf0b7 " + sentence + " \uf0b7 In general, these algorithms are fast to train."
+
+        for question in (
+            "Disadvantages of Random Forest?",
+            "what are disadvantages of Random Forest?",
+        ):
+            with self.subTest(question=question):
+                answer, calls = self._run_generation(
+                    question,
+                    {
+                        "text": passage,
+                        "source": "811790898-Random-Forest-Algorithm.pdf",
+                        "page": 37,
+                    },
+                    "INSUFFICIENT EVIDENCE",
+                )
+                self.assertEqual(
+                    answer,
+                    sentence + "\n\nSources: [Evidence 1] 811790898-Random-Forest-Algorithm.pdf, page 37",
+                )
+                self.assertEqual(calls, 1)
+
+    def test_short_disadvantages_query_still_abstains_without_supported_evidence(self):
+        answer, calls = self._run_generation(
+            "Disadvantages of Random Forest?",
+            {
+                "text": "CNN is a neural network that uses convolutional layers.",
+                "source": "notes.pdf",
+                "page": 4,
+            },
+            "INSUFFICIENT EVIDENCE",
+        )
+
+        self.assertIn("couldn't find sufficient direct evidence", answer)
+        self.assertNotIn("Sources:", answer)
+        self.assertEqual(calls, 1)
+
+    def test_pdf_cleaner_normalizes_known_private_use_bullet_artifact(self):
+        cleaned = rag.clean_pdf_text("\uf0b7 First sentence. \uf0b7 Second sentence.")
+
+        self.assertEqual(cleaned, "First sentence. Second sentence.")
+        self.assertNotIn("\uf0b7", cleaned)
+
     def test_comparison_parser_extracts_entities_and_ignores_output_instructions(self):
         self.assertEqual(
             rag._requested_comparison("Compare CNN and RNN. Show the exact sources."),
@@ -249,6 +298,22 @@ class CitationTests(unittest.TestCase):
         self.assertEqual(
             rag._requested_comparison("Compare CNN versus RNN"),
             ("CNN", "RNN"),
+        )
+
+    def test_pdf_cleaner_restores_boundary_between_heading_and_following_sentence(self):
+        raw = (
+            "Difference between Decision Tree and Random Forest Hence, there is a conclusion "
+            "that random forests are much more successful than decision trees only if the "
+            "trees are diverse and acceptable."
+        )
+
+        cleaned = rag.clean_pdf_text(raw)
+
+        self.assertEqual(
+            cleaned,
+            "Difference between Decision Tree and Random Forest. Hence, there is a conclusion "
+            "that random forests are much more successful than decision trees only if the "
+            "trees are diverse and acceptable.",
         )
 
     def test_supported_cnn_rnn_comparison_cites_exact_page_34_sentence(self):

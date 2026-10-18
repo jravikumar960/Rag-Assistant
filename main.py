@@ -51,8 +51,20 @@ def clean_pdf_text(text: str) -> str:
         return ""
 
     text = text.replace("\u00a0", " ").replace("\u200b", "")
+    # pypdf extracts this PDF's bullet glyph as a private-use character that
+    # some Streamlit/browser fonts render as a replacement symbol.
+    text = text.replace("\uf0b7", " ")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[\t\f\v]+", " ", text)
+
+    # Some PDF extractors omit punctuation and line breaks between a short
+    # heading and the following sentence. Restore a sentence boundary before
+    # common sentence-opening transitions without changing any evidence words.
+    text = re.sub(
+        r"(?<=[\w)])\s+(?=(?:Hence|Therefore|However|Moreover|Furthermore|In general|In most real-world applications)\b)",
+        ". ",
+        text,
+    )
 
     # Preserve blank-line paragraph breaks. Collapse only line wraps inside a
     # paragraph, rather than flattening the whole page into one text block.
@@ -427,6 +439,7 @@ def _requested_relation(question: str) -> tuple[str, str] | None:
     q = re.sub(r"[?!.]+$", "", q)
     patterns = (
         (r"what\s+are\s+(?:the\s+)?(?:disadvantages?|drawbacks?|limitations?|weaknesses?)\s+of\s+(.+)", "limitation"),
+        (r"(?:the\s+)?(?:disadvantages?|drawbacks?|limitations?|weaknesses?)\s+of\s+(.+)", "limitation"),
         (r"what\s+is\s+(?:the\s+)?(?:disadvantage|drawback|limitation|weakness)\s+of\s+(.+)", "limitation"),
         (r"what\s+is\s+(?:the\s+)?(.+)", "definition"),
         (r"define\s+(.+)", "definition"),
@@ -671,8 +684,10 @@ def generate_answer(question: str, retrieved_chunks: list[dict], tokenizer, llm)
     proposed = tokenizer.decode(
         output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True,
     ).strip()
-    if not proposed or proposed.upper() == "INSUFFICIENT EVIDENCE":
-        if comparison is None:
+    insufficient_proposal = not proposed or proposed.upper() == "INSUFFICIENT EVIDENCE"
+    if insufficient_proposal:
+        requested = _requested_relation(question)
+        if comparison is None and not (requested and requested[1] == "limitation"):
             return "I couldn't find sufficient direct evidence in the retrieved PDF passages to answer this question."
         verified = []
     else:
@@ -692,6 +707,8 @@ def generate_answer(question: str, retrieved_chunks: list[dict], tokenizer, llm)
         if direct_limitation is not None:
             verified = [direct_limitation]
     if not verified:
+        if insufficient_proposal:
+            return "I couldn't find sufficient direct evidence in the retrieved PDF passages to answer this question."
         return "I couldn't verify a direct answer to this question from the retrieved PDF passages."
 
     sources = []
