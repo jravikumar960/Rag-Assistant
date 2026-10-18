@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from pypdf import PdfReader
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Paths and model configuration
@@ -24,8 +24,10 @@ LLM_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 CHUNK_SIZE = 180
 CHUNK_OVERLAP = 35
 EMBEDDING_BATCH_SIZE = 64
-INDEX_CACHE_VERSION = 3
+INDEX_CACHE_VERSION = 4
 TOP_K = 5
+RETRIEVAL_CANDIDATES = 20
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 MIN_RELEVANCE_SCORE = 0.20
 RRF_CONSTANT = 60
 DEBUG = False
@@ -44,12 +46,20 @@ class TextChunk(TypedDict):
 
 
 def clean_pdf_text(text: str) -> str:
-    """Normalize whitespace and repair known joined phrases from PDF extraction."""
+    """Normalize PDF text while preserving paragraph boundaries for safer chunking."""
     if not text:
         return ""
+
     text = text.replace("\u00a0", " ").replace("\u200b", "")
-    text = re.sub(r"[\t\r\f\v]+", " ", text)
-    text = re.sub(r" *\n *", " ", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[\t\f\v]+", " ", text)
+
+    # Preserve blank-line paragraph breaks. Collapse only line wraps inside a
+    # paragraph, rather than flattening the whole page into one text block.
+    paragraphs = re.split(r"\n\s*\n+", text)
+    paragraphs = [re.sub(r"\s+", " ", part).strip() for part in paragraphs if part.strip()]
+    text = "\n\n".join(paragraphs)
+
     replacements = [
         (r"\bDeepLearningtechniques\b", "Deep Learning techniques"),
         (r"\bTounderstand\b", "To understand"),
@@ -65,7 +75,9 @@ def clean_pdf_text(text: str) -> str:
     ]
     for pattern, replacement in replacements:
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
-    return re.sub(r"\s+", " ", text).strip()
+
+    paragraphs = [re.sub(r"\s+", " ", part).strip() for part in re.split(r"\n\s*\n+", text) if part.strip()]
+    return "\n\n".join(paragraphs)
 
 
 def load_pdfs() -> list[DocumentPage]:
@@ -97,24 +109,32 @@ def create_chunks(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
 ) -> list[TextChunk]:
-    """Create overlapping chunks without mixing text from separate pages."""
+    """Chunk within paragraphs so one concept is less likely to bleed into another."""
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
     if overlap < 0 or overlap >= chunk_size:
         raise ValueError("overlap must be smaller than chunk_size")
+
     result: list[TextChunk] = []
     step = chunk_size - overlap
     for doc in documents:
-        words = doc["text"].split()
-        start = 0
-        while start < len(words):
-            end = min(start + chunk_size, len(words))
-            text = " ".join(words[start:end]).strip()
-            if text:
-                result.append({"text": text, "source": doc["source"], "page": doc["page"]})
-            if end >= len(words):
-                break
-            start += step
+        # The PDF cleaner preserves blank lines. Do not join adjacent paragraphs
+        # by default: adjacent paragraphs may discuss different concepts.
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", doc["text"]) if p.strip()]
+        if not paragraphs:
+            paragraphs = [doc["text"].strip()] if doc["text"].strip() else []
+
+        for paragraph in paragraphs:
+            words = paragraph.split()
+            start = 0
+            while start < len(words):
+                end = min(start + chunk_size, len(words))
+                chunk_text = " ".join(words[start:end]).strip()
+                if chunk_text:
+                    result.append({"text": chunk_text, "source": doc["source"], "page": doc["page"]})
+                if end >= len(words):
+                    break
+                start += step
     return result
 
 
@@ -278,6 +298,39 @@ def search_chunks(
     return results
 
 
+def load_reranker() -> CrossEncoder:
+    """Load a cross-encoder used to rerank the hybrid retriever's shortlist."""
+    logging.info("Loading reranker: %s", RERANKER_MODEL)
+    return CrossEncoder(RERANKER_MODEL, max_length=512)
+
+
+def rerank_chunks(
+    question: str,
+    candidates: list[dict],
+    reranker: CrossEncoder,
+    top_k: int = TOP_K,
+) -> list[dict]:
+    """Re-score retrieved query/passage pairs and return the most relevant passages.
+
+    The original cosine score is retained in `score` for existing relevance checks;
+    the cross-encoder score is stored separately as `rerank_score`.
+    """
+    if not candidates or top_k <= 0:
+        return []
+    pairs = [(question, str(item.get("text", ""))) for item in candidates]
+    scores = reranker.predict(pairs, show_progress_bar=False)
+    ranked = []
+    for item, score in zip(candidates, scores):
+        updated = dict(item)
+        updated["rerank_score"] = float(score)
+        ranked.append(updated)
+    ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
+    selected = ranked[:top_k]
+    for rank, item in enumerate(selected, start=1):
+        item["rank"] = rank
+    return selected
+
+
 def load_local_llm():
     tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL)
     if tokenizer.pad_token_id is None:
@@ -338,8 +391,12 @@ def validate_answer(question: str, answer: str, context: str, tokenizer, llm) ->
     messages = [
         {"role": "system", "content": (
             "You are a conservative PDF answer editor. Use only the supplied "
-            "evidence. Remove unsupported claims. Do not add facts. If the "
-            "evidence is insufficient, say so. Return only the revised answer, "
+            "evidence. Remove unsupported claims. Do not add facts. Do not transfer "
+            "a property or disadvantage from one concept to another concept that is "
+            "merely listed as an example nearby. A mention of a topic is not evidence "
+            "for every property of that topic. If the evidence does not specifically "
+            "support the requested property of the requested topic, state that the "
+            "PDF does not provide enough evidence. Return only the revised answer, "
             "without citations."
         )},
         {"role": "user", "content": (
@@ -361,94 +418,141 @@ def validate_answer(question: str, answer: str, context: str, tokenizer, llm) ->
     return revised or answer
 
 
-def select_citations(
-    question: str,
-    answer: str,
-    retrieved_chunks: list[dict],
-    max_sources: int = 1,
-) -> list[int]:
-    """Return only the highest-ranked passage that supports the answer."""
-    if not question or not answer or not retrieved_chunks or max_sources <= 0:
-        return []
-    stopwords = {
-        "what", "is", "the", "a", "an", "and", "or", "to", "of", "in",
-        "on", "for", "with", "how", "does", "do", "between", "difference",
-        "different", "compare", "comparison", "versus", "vs", "explain",
-        "describe", "tell", "me", "about", "from", "pdf", "this", "that",
-        "are", "was", "were", "be", "can", "could", "would", "should",
-        "while", "using", "uses",
-    }
 
-    def terms(text: str) -> set[str]:
-        return {term for term in _tokens(text) if len(term) > 2 and term not in stopwords}
-
-    question_terms = terms(question)
-    answer_terms = terms(answer)
-    ranked: list[tuple[float, int]] = []
-    for evidence_id, chunk in enumerate(retrieved_chunks, start=1):
-        passage_terms = terms(chunk.get("text", ""))
-        answer_overlap = len(answer_terms & passage_terms)
-        if not answer_overlap:
-            continue
-        question_overlap = len(question_terms & passage_terms)
-        answer_coverage = answer_overlap / max(1, len(answer_terms))
-        question_coverage = question_overlap / max(1, len(question_terms))
-        retrieval_score = float(chunk.get("rrf_score", chunk.get("score", 0.0)))
-        score = (
-            4 * answer_overlap
-            + 2 * question_overlap
-            + 4 * answer_coverage
-            + question_coverage
-            + retrieval_score
-        )
-        ranked.append((score, evidence_id))
-
-    ranked.sort(
-        key=lambda item: (
-            -item[0],
-            int(retrieved_chunks[item[1] - 1].get("rank", item[1])),
-        )
+def _requested_relation(question: str) -> tuple[str, str] | None:
+    """Return a narrowly supported topic/relation pair, or None."""
+    # Ignore output instructions appended after the actual question, so they
+    # do not become part of the requested topic.
+    q = question.strip().split("?", 1)[0]
+    q = re.sub(r"[?!.]+$", "", q)
+    patterns = (
+        (r"what\s+are\s+(?:the\s+)?(?:disadvantages?|drawbacks?|limitations?|weaknesses?)\s+of\s+(.+)", "limitation"),
+        (r"what\s+is\s+(?:the\s+)?(?:disadvantage|drawback|limitation|weakness)\s+of\s+(.+)", "limitation"),
+        (r"what\s+is\s+(?:the\s+)?(.+)", "definition"),
+        (r"define\s+(.+)", "definition"),
+        (r"explain\s+(.+)", "definition"),
+        (r"what\s+does\s+(.+?)\s+use", "uses"),
     )
-    return [ranked[0][1]] if ranked else []
+    for pattern, relation in patterns:
+        match = re.fullmatch(pattern, q, re.IGNORECASE)
+        if match:
+            topic = re.sub(r"^(?:a|an|the)\s+", "", match.group(1).strip(), flags=re.IGNORECASE)
+            return (topic, relation) if topic else None
+    if re.search(r"\bvanishing\s+gradients?\b", q, re.IGNORECASE) and re.search(
+        r"\b(how|why|effect|affect|impact|prevent|cause|training)\b", q, re.IGNORECASE
+    ):
+        return ("vanishing gradients", "gradient_effect")
+    return None
+
+
+def _answer_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part.strip()]
+
+
+def _normalize_sentence_for_match(sentence: str) -> str:
+    """Ignore PDF list glyphs at sentence start while preserving sentence text."""
+    sentence = re.sub(r"^\s*[\uf097\uf0b7\u2022\u25cf\u25aa\u2023]\s*", "", sentence)
+    return " ".join(sentence.split())
+
+
+def _supports_requested_relation(question: str, sentence: str) -> bool:
+    requested = _requested_relation(question)
+    if requested is None:
+        return False
+    topic, relation = requested
+    topic_re = r"\b" + r"\s+".join(re.escape(word) for word in topic.split()) + r"\b"
+    if relation == "definition":
+        return bool(re.search(topic_re + r"\s+(?:is|are|means|refers\s+to|is\s+defined\s+as)\b", sentence, re.IGNORECASE))
+    if relation == "uses":
+        return bool(re.search(r"^\s*(?:(?:the|a|an)\s+)?" + topic_re + r"\s+uses?\b", sentence, re.IGNORECASE))
+    if relation == "limitation":
+        relation_re = r"(?:disadvantage|drawback|limitation|weakness)(?:s)?"
+        return bool(
+            re.search(relation_re + r"\s+of\s+" + topic_re + r"\s+(?:is|are|include|includes)\b", sentence, re.IGNORECASE)
+            or re.search(topic_re + r"\s+(?:has|have)\s+(?:a\s+)?(?:\w+\s+){0,3}" + relation_re + r"\b", sentence, re.IGNORECASE)
+        )
+    if relation == "gradient_effect":
+        return bool(
+            re.search(r"\bvanishing\s+gradients?\b", sentence, re.IGNORECASE)
+            and re.search(r"\b(?:prevent|stop|cause|lead\s+to|result\s+in)\b", sentence, re.IGNORECASE)
+            and re.search(r"\b(?:train(?:ed|ing)?|network|gradient)\b", sentence, re.IGNORECASE)
+        )
+    return False
+
+
+def _verified_answer_sentences(question: str, answer: str, passages: list[dict]):
+    """Accept only complete generated sentences found verbatim in evidence."""
+    generated = _answer_sentences(answer)
+    if not generated or _requested_relation(question) is None:
+        return []
+    verified = []
+    for proposed in generated:
+        match = None
+        for index, passage in enumerate(passages, start=1):
+            for source_sentence in _answer_sentences(str(passage.get("text", ""))):
+                if (
+                    _normalize_sentence_for_match(proposed)
+                    == _normalize_sentence_for_match(source_sentence)
+                    and _supports_requested_relation(question, source_sentence)
+                ):
+                    match = (_normalize_sentence_for_match(source_sentence), index)
+                    break
+            if match:
+                break
+        if match is None:
+            return []
+        verified.append(match)
+    return verified
+
+
+def _first_supported_definition(question: str, passages: list[dict]):
+    """Extract a direct definition from ranked evidence for supported definition queries."""
+    requested = _requested_relation(question)
+    if requested is None or requested[1] != "definition":
+        return None
+    for index, passage in enumerate(passages, start=1):
+        for sentence in _answer_sentences(str(passage.get("text", ""))):
+            if _supports_requested_relation(question, sentence):
+                return (_normalize_sentence_for_match(sentence), index)
+    return None
+
+
+def _first_supported_limitation(question: str, passages: list[dict]):
+    """Extract an exact, topic-linked limitation sentence from retrieved evidence."""
+    requested = _requested_relation(question)
+    if requested is None or requested[1] != "limitation":
+        return None
+    for index, passage in enumerate(passages, start=1):
+        for sentence in _answer_sentences(str(passage.get("text", ""))):
+            if _supports_requested_relation(question, sentence):
+                return (_normalize_sentence_for_match(sentence), index)
+    return None
+
+
+def select_citations(question, answer, passages):
+    """Select only passages containing exact, relation-checked answer sentences."""
+    return list(dict.fromkeys(index for _, index in _verified_answer_sentences(question, answer, passages)))
 
 
 def generate_answer(question: str, retrieved_chunks: list[dict], tokenizer, llm) -> str:
-    """Generate a concise answer with one highest-ranked supporting citation."""
+    """Generate once, then return only exact evidence sentences that pass a supported relation rule."""
     if not retrieved_chunks:
         return "I couldn't find relevant information in the PDF to answer this question."
-
-    # Conservative direct extraction for a known phrase in the provided PDF.
-    # Other questions use the general evidence-grounded path below.
-    if re.search(r"\bvanishing\s+gradients?\b", question, re.I):
-        matches = [
-            c for c in retrieved_chunks
-            if re.search(r"\bvanishing\s+gradients?\b", c.get("text", ""), re.I)
-            and re.search(r"not being trained properly|gradient.{0,30}(small|vanish)|vanishing gradient", c.get("text", ""), re.I)
-        ]
-        if not matches:
-            return "I couldn't find sufficiently direct evidence in the retrieved PDF passages to answer this question."
-        match = matches[0]
-        evidence_id = retrieved_chunks.index(match) + 1
-        return (
-            "The PDF explains that vanishing gradients can prevent the network "
-            "from being trained properly.\n\nSources: "
-            f"[Evidence {evidence_id}] {match['source']}, page {match['page']}"
-        )
+    if _requested_relation(question) is None:
+        return "I couldn't verify a direct answer to this question from the retrieved PDF passages."
 
     context = "\n\n".join(
         f"[Evidence {i} | Source: {c['source']} | Page: {c['page']}]\n{c['text']}"
         for i, c in enumerate(retrieved_chunks, start=1)
     )
-    system_prompt = """Answer the question using ONLY the supplied PDF evidence.
-Do not use outside knowledge, assumptions, or invented details.
-Answer the exact question. Preserve the PDF's terminology.
-For comparisons, discuss each subject only to the extent supported by evidence.
-Do not add mechanisms, examples, applications, or technical details unless
-the passages state them. If evidence is incomplete, say what is missing.
-Answer in at most three concise sentences. Do not include citations.
-Return only the answer."""
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": (
+            "Select only exact sentence(s) from the supplied PDF evidence that directly state "
+            "the requested relation. Copy every selected sentence verbatim, including punctuation. "
+            "Do not paraphrase, combine, explain, or add facts. If no sentence directly answers "
+            "the question, return exactly: INSUFFICIENT EVIDENCE. Return only selected sentence(s) "
+            "or that abstention phrase."
+        )},
         {"role": "user", "content": f"Question:\n{question}\n\nPDF evidence:\n{context}"},
     ]
     prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -458,35 +562,35 @@ Return only the answer."""
     llm.eval()
     with torch.no_grad():
         output_ids = llm.generate(
-            **inputs, max_new_tokens=120, do_sample=False, num_beams=1,
+            **inputs, max_new_tokens=220, do_sample=False, num_beams=1,
             repetition_penalty=1.08, pad_token_id=tokenizer.eos_token_id,
         )
-    answer = tokenizer.decode(
-        output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+    proposed = tokenizer.decode(
+        output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True,
     ).strip()
-    answer = re.sub(r"\n{3,}", "\n\n", answer).strip()
-    if not answer:
-        return "I couldn't generate an answer from the retrieved PDF evidence."
+    if not proposed or proposed.upper() == "INSUFFICIENT EVIDENCE":
+        return "I couldn't find sufficient direct evidence in the retrieved PDF passages to answer this question."
 
-    if any(marker in answer.lower() for marker in (
-        "pdf evidence is insufficient", "does not provide enough information",
-        "couldn't find relevant information", "couldn't find sufficiently relevant information",
-    )):
-        return "I couldn't find sufficient evidence in the retrieved PDF passages to answer this question."
+    verified = _verified_answer_sentences(question, proposed, retrieved_chunks)
+    if not verified:
+        direct_definition = _first_supported_definition(question, retrieved_chunks)
+        if direct_definition is not None:
+            verified = [direct_definition]
+    if not verified:
+        direct_limitation = _first_supported_limitation(question, retrieved_chunks)
+        if direct_limitation is not None:
+            verified = [direct_limitation]
+    if not verified:
+        return "I couldn't verify a direct answer to this question from the retrieved PDF passages."
 
-    selected = select_citations(question, answer, retrieved_chunks)
-    if not selected:
-        return "I couldn't identify a sufficiently relevant source passage to support the generated answer."
     sources = []
-    for evidence_id in selected:
-        if not 1 <= evidence_id <= len(retrieved_chunks):
-            continue
+    for _, evidence_id in verified:
         chunk = retrieved_chunks[evidence_id - 1]
-        sources.append(
-            f"[Evidence {evidence_id}] {chunk['source']}, page {chunk['page']}"
-        )
-    return answer + ("\n\nSources: " + "; ".join(sources) if sources else "")
-
+        source = f"[Evidence {evidence_id}] {chunk['source']}, page {chunk['page']}"
+        if source not in sources:
+            sources.append(source)
+    answer = " ".join(sentence for sentence, _ in verified)
+    return answer + "\n\nSources: " + "; ".join(sources)
 
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -537,6 +641,14 @@ def main() -> int:
         if re.search(r"\b(course\s+)?objectives?\b", question, re.I):
             answer = extract_course_objectives(pages, page_filter)
         if answer is None:
+            if DEBUG:
+                print("\n=== CHUNKS PASSED TO ANSWER GENERATION ===")
+                for i, chunk in enumerate(results, start=1):
+                    print(
+                        f"\nEvidence {i} | Page: {chunk.get('page')} "
+                        f"| Score: {chunk.get('score', 'N/A')}\n"
+                        f"{chunk.get('text', '')}\n"
+                    )
             answer = generate_answer(question, results, tokenizer, llm)
         print(f"\nAnswer:\n{answer}")
     return 0
